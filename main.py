@@ -108,6 +108,181 @@ def apply_price_adjustments(items: List[Dict[str, Any]], base_url: str) -> List[
     except Exception:
         return items
 
+# --- Helpers for deposit band classification using Carjet filters ---
+def _collect_form_inputs(html_text: str) -> Dict[str, str]:
+    try:
+        soup = BeautifulSoup(html_text or "", "lxml")
+        frm = soup.find("form", {"id": "formulario"})
+        data: Dict[str, str] = {}
+        if not frm:
+            return data
+        for inp in frm.find_all("input"):
+            name = inp.get("name")
+            if not name:
+                continue
+            val = inp.get("value", "")
+            data[name] = val
+        return data
+    except Exception:
+        return {}
+
+def _items_key(it: Dict[str, Any]) -> str:
+    car = (it.get("car") or "").strip().lower()
+    sup = (it.get("supplier") or "").strip().lower()
+    return f"{sup}|||{car}"
+
+async def _fetch_carjet_filtered_by_dep(html_text: str, lang: str, headers: Dict[str, str], dep_value: str) -> List[Dict[str, Any]]:
+    try:
+        form_data = _collect_form_inputs(html_text)
+        if not form_data:
+            return []
+        form_data["frmDep"] = dep_value
+        form_data.setdefault("frmMoneda", "EUR")
+        form_data.setdefault("frmMonedaForzada", "EUR")
+        form_data.setdefault("frmPrvNo", "none")
+        form_data.setdefault("frmTipoVeh", form_data.get("frmTipoVeh", "CAR"))
+        # Try to extract s/b tokens from page HTML (actionList or embedded URLs)
+        try:
+            ms = re.search(r"[?&]s=([A-Za-z0-9-]+)", html_text)
+            mb = re.search(r"[?&]b=([A-Za-z0-9-]+)", html_text)
+            if ms and (not form_data.get("s")):
+                form_data["s"] = ms.group(1)
+            if mb and (not form_data.get("b")):
+                form_data["b"] = mb.group(1)
+            # Also check actionList JS var
+            ma = re.search(r"var\s+actionList\s*=\s*'[^']*\?(.*?)';", html_text)
+            if ma:
+                try:
+                    from urllib.parse import parse_qsl as _parse_qsl
+                    qd = dict(_parse_qsl(ma.group(1)))
+                    if (not form_data.get("s")) and qd.get("s"):
+                        form_data["s"] = qd.get("s")
+                    if (not form_data.get("b")) and qd.get("b"):
+                        form_data["b"] = qd.get("b")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        url = urljoin("https://www.carjet.com/", f"do/list/{lang}")
+        html2 = ""
+        try:
+            # Prefer our async fetch helper if it supports method/data
+            r = await async_fetch_with_optional_proxy(url, method="POST", headers=headers, data=form_data)
+            r.raise_for_status()
+            html2 = r.text or ""
+        except TypeError:
+            # Fallback to synchronous requests
+            import requests as _req
+            rr = _req.post(url, headers=headers, data=form_data, timeout=20)
+            rr.raise_for_status()
+            html2 = rr.text
+        if not html2:
+            return []
+        base = "https://www.carjet.com/"
+        return parse_prices(html2, base)
+    except Exception:
+        return []
+
+async def _enrich_deposit_level_from_filters(html_text: str, url: str, headers: Dict[str, str], items: List[Dict[str, Any]]):
+    """Set deposit_level using the CarJet page state: if frmDep=250 or 500 is checked, apply globally.
+    Otherwise, fall back to membership classification via _classify_all_bands.
+    """
+    try:
+        if not html_text or not items:
+            return
+        # Detect checked radios in the HTML (Low/Medium)
+        low_checked = False
+        med_checked = False
+        try:
+            low_checked = bool(re.search(r'id=\"chkDep250\"[^>]*checked', html_text, re.I)) or bool(re.search(r'name=\"frmDep\"[^>]*value=\"250\"[^>]*checked', html_text, re.I))
+            med_checked = bool(re.search(r'id=\"chkDep500\"[^>]*checked', html_text, re.I)) or bool(re.search(r'name=\"frmDep\"[^>]*value=\"500\"[^>]*checked', html_text, re.I))
+        except Exception:
+            low_checked = False
+            med_checked = False
+        if low_checked or med_checked:
+            level = "low" if low_checked else "medium"
+            for it in items:
+                try:
+                    it["deposit_level"] = level
+                except Exception:
+                    continue
+            return
+        # If no radio selected, classify by membership
+        await _classify_all_bands(html_text, url, headers, items)
+    except Exception:
+        return
+
+async def _classify_all_bands(html_text: str, url: str, headers: Dict[str, str], items: List[Dict[str, Any]]):
+    """Classify every item into low/medium/high via CarJet filtered membership (<=250, <=500)."""
+    try:
+        if not html_text or not items:
+            return
+        # Derive language from URL
+        lang = "pt"
+        try:
+            from urllib.parse import urlparse as _up
+            pr = _up(url)
+            m = re.search(r"/do/list/([a-z]{2})", pr.path or "", re.I)
+            if m:
+                lang = m.group(1).lower()
+        except Exception:
+            lang = "pt"
+        # Fetch both membership sets
+        low_items = await _fetch_carjet_filtered_by_dep(html_text, lang, headers, "250")
+        med_items = await _fetch_carjet_filtered_by_dep(html_text, lang, headers, "500")
+        def _k(it):
+            return (str(it.get("supplier") or "").strip().lower(), str(it.get("car") or "").strip().lower())
+        low_set = set(_k(it) for it in (low_items or []))
+        med_set = set(_k(it) for it in (med_items or []))
+        for it in items:
+            try:
+                key = _k(it)
+                if key in low_set:
+                    it["deposit_level"] = "low"
+                elif key in med_set and key not in low_set:
+                    it["deposit_level"] = "medium"
+                else:
+                    it["deposit_level"] = "high"
+            except Exception:
+                continue
+    except Exception:
+        return
+        # Fetch low (<=250) and medium (<=500) filtered results and build key sets
+        low_items = await _fetch_carjet_filtered_by_dep(html_text, lang, headers, "250")
+        med_items = await _fetch_carjet_filtered_by_dep(html_text, lang, headers, "500")
+        low_keys = set(_items_key(it) for it in (low_items or []))
+        med_keys = set(_items_key(it) for it in (med_items or []))
+        # Debug: write counts for troubleshooting
+        try:
+            with open(DEBUG_DIR / "deposit_enrich.txt", "a", encoding="utf-8") as _fp:
+                _fp.write(f"low={len(low_keys)} med={len(med_keys)} time={time.strftime('%H:%M:%S')}\n")
+        except Exception:
+            pass
+        # If neither list returned items, do not override earlier checkbox-based levels
+        if not low_keys and not med_keys:
+            return
+        # Supplier-only fallback sets for lenient matching
+        def _sup(s):
+            return (s or "").strip().lower()
+        low_sups = set(_sup(it.get("supplier")) for it in (low_items or []))
+        med_sups = set(_sup(it.get("supplier")) for it in (med_items or []))
+        # Assign deposit_level strictly by membership in CarJet filtered results
+        med_only_keys = set(k for k in med_keys if k not in low_keys)
+        for it in items:
+            try:
+                key = _items_key(it)
+                sup_only = _sup(it.get("supplier"))
+                if key in low_keys or sup_only in low_sups:
+                    it["deposit_level"] = "low"
+                elif (key in med_only_keys) or (sup_only in med_sups and sup_only not in low_sups):
+                    it["deposit_level"] = "medium"
+                else:
+                    it["deposit_level"] = "high"
+            except Exception:
+                continue
+    except Exception:
+        return
+
 def scrape_with_playwright(url: str) -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
     if not _HAS_PLAYWRIGHT:
@@ -1441,7 +1616,8 @@ async def track_by_params(request: Request):
             pass
         if not html:
             return _no_store_json({"ok": False, "error": "Upstream fetch failed"}, status_code=502)
-        base = f"https://www.carjet.com/do/list/{lang}"
+        # Use site root as base for robust urljoin of absolute/relative hrefs
+        base = "https://www.carjet.com/"
         items = parse_prices(html, base)
         items = convert_items_gbp_to_eur(items)
         items = apply_price_adjustments(items, base)
@@ -1456,6 +1632,11 @@ async def track_by_params(request: Request):
                 "days": days,
                 "count": len(items or []),
                 "preview": (items or [])[:5],
+                "bands_count": (lambda itms: {
+                    "low": sum(1 for x in itms if x.get("deposit_band") == "low"),
+                    "medium": sum(1 for x in itms if x.get("deposit_band") == "medium"),
+                    "high": sum(1 for x in itms if x.get("deposit_band") == "high"),
+                })(items or []),
             }
             (DEBUG_DIR / f"track_params-summary-{_loc_tag}-{_stamp}.json").write_text(_json.dumps(_sum, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
@@ -2903,6 +3084,74 @@ def parse_prices(html: str, base_url: str) -> List[Dict[str, Any]]:
             # Skip blocked models
             if car_name and _is_blocked_model(car_name):
                 continue
+            # Try to extract deposit and franchise/excess values from the card text
+            try:
+                _card_text_full = card.get_text(" \n", strip=True)
+            except Exception:
+                _card_text_full = ""
+            def _find_amount_near_keywords(text: str, keywords):
+                try:
+                    import re as _re
+                    if not text:
+                        return ""
+                    # Work line by line to increase precision
+                    lines = [l.strip() for l in text.split("\n") if l.strip()]
+                    amt_rx = _re.compile(r"(€\s*\d[\d\.,]*|\d[\d\.,]*\s*€|EUR\s*\d[\d\.,]*)", _re.I)
+                    key_rx = _re.compile(r"(" + "|".join(keywords) + r")", _re.I)
+                    for ln in lines:
+                        if key_rx.search(ln):
+                            m = amt_rx.search(ln)
+                            if m:
+                                return m.group(1)
+                    # Fallback: search window around first keyword occurrence
+                    mpos = key_rx.search(text)
+                    if mpos:
+                        s = max(0, mpos.start() - 60)
+                        e = min(len(text), mpos.end() + 120)
+                        win = text[s:e]
+                        m2 = amt_rx.search(win)
+                        if m2:
+                            return m2.group(1)
+                except Exception:
+                    return ""
+                return ""
+            deposit_text = _find_amount_near_keywords(
+                _card_text_full,
+                [r"dep[oó]sito", r"cau[cç][aã]o", r"dep[oó]sit", r"deposit"]
+            )
+            franchise_text = _find_amount_near_keywords(
+                _card_text_full,
+                [r"franq[uú]ia", r"excesso", r"excess", r"franchise", r"deductible", r"dedut[ií]vel"]
+            )
+
+            # Guard against mis-capture: if deposit >= franchise, clear deposit
+            try:
+                dep_num = _parse_amount(deposit_text) if deposit_text else None
+            except Exception:
+                dep_num = None
+            try:
+                fra_num = _parse_amount(franchise_text) if franchise_text else None
+            except Exception:
+                fra_num = None
+            try:
+                if dep_num is not None and fra_num is not None and dep_num >= fra_num:
+                    deposit_text = ""
+                    dep_num = None
+            except Exception:
+                pass
+            # Classify deposit level; default to high when missing
+            deposit_level = "high"
+            try:
+                if dep_num is not None:
+                    if dep_num <= 250:
+                        deposit_level = "low"
+                    elif dep_num <= 500:
+                        deposit_level = "medium"
+                    else:
+                        deposit_level = "high"
+            except Exception:
+                deposit_level = "high"
+
             items.append({
                 "id": idx,
                 "car": car_name,
@@ -2913,6 +3162,9 @@ def parse_prices(html: str, base_url: str) -> List[Dict[str, Any]]:
                 "transmission": transmission_label,
                 "photo": photo,
                 "link": link,
+                "deposit": deposit_text,
+                "deposit_level": deposit_level,
+                "franchise": franchise_text,
             })
             idx += 1
         if items:
@@ -2990,6 +3242,37 @@ def parse_prices(html: str, base_url: str) -> List[Dict[str, Any]]:
 
         # detect currency symbol present in the text
         curr = "EUR" if re.search(r"EUR", price_text, re.I) else ("EUR" if "€" in price_text else "")
+        # Try to extract deposit/franchise from this container's text
+        try:
+            _ctxt = container.get_text(" \n", strip=True)
+        except Exception:
+            _ctxt = ""
+        def _fx_amount(text: str, keywords):
+            try:
+                if not text:
+                    return ""
+                import re as _re
+                lines = [l.strip() for l in text.split("\n") if l.strip()]
+                amt_rx = _re.compile(r"(€\s*\d[\d\.,]*|\d[\d\.,]*\s*€|EUR\s*\d[\d\.,]*)", _re.I)
+                key_rx = _re.compile(r"(" + "|".join(keywords) + r")", _re.I)
+                for ln in lines:
+                    if key_rx.search(ln):
+                        m = amt_rx.search(ln)
+                        if m:
+                            return m.group(1)
+                mpos = key_rx.search(text)
+                if mpos:
+                    s = max(0, mpos.start() - 60)
+                    e = min(len(text), mpos.end() + 120)
+                    win = text[s:e]
+                    m2 = amt_rx.search(win)
+                    if m2:
+                        return m2.group(1)
+            except Exception:
+                return ""
+            return ""
+        dep_val = _fx_amount(_ctxt, [r"dep[oó]sito", r"cau[cç][aã]o", r"dep[oó]sit", r"deposit"])
+        fra_val = _fx_amount(_ctxt, [r"franq[uú]ia", r"excesso", r"excess", r"franchise", r"deductible", r"dedut[ií]vel"])
         items.append({
             "id": idx,
             "car": car_name,
@@ -2999,6 +3282,8 @@ def parse_prices(html: str, base_url: str) -> List[Dict[str, Any]]:
             "category": category,
             "transmission": transmission_label,
             "link": link,
+            "deposit": dep_val,
+            "franchise": fra_val,
         })
         if len(items) >= 50:
             break
@@ -3032,6 +3317,87 @@ def url_from_row(row, base_url: str) -> str:
         if m:
             return m.group(0)
     return ""
+
+# --- Deep insurance enrichment ---
+async def _enrich_insurance(items: List[Dict[str, Any]], headers: Optional[Dict[str, str]] = None, limit: int = 50) -> None:
+    try:
+        import re as _re
+        sem = asyncio.Semaphore(4)
+        headers = headers or {"User-Agent": "Mozilla/5.0 (compatible; PriceTracker/1.0)"}
+        async def _fetch_and_parse(it: Dict[str, Any]):
+            url = (it.get("link") or "").strip()
+            if not url or not (url.startswith("http://") or url.startswith("https://")):
+                return (None, None)
+            try:
+                async with sem:
+                    r = await async_fetch_with_optional_proxy(url, headers=headers)
+                    r.raise_for_status()
+                    txt = r.text or ""
+            except Exception:
+                return (None, None)
+            # Parse HTML to visible text for robust matching (handles split spans)
+            try:
+                soup = BeautifulSoup(txt, "lxml")
+                text = soup.get_text(" ", strip=True)
+            except Exception:
+                text = _re.sub(r"\s+", " ", txt)
+            # Helper to find amount near keywords
+            def _find_amt(keywords: List[str]):
+                try:
+                    key_rx = _re.compile(r"(" + "|".join(keywords) + r")", _re.I)
+                    amt_rx = _re.compile(r"(€\s*\d[\d\.,]*|\d[\d\.,]*\s*€|EUR\s*\d[\d\.,]*)", _re.I)
+                    m = key_rx.search(text)
+                    if not m:
+                        return None
+                    s = max(0, m.start() - 200)
+                    e = min(len(text), m.end() + 200)
+                    win = text[s:e]
+                    m2 = amt_rx.search(win)
+                    if m2:
+                        return m2.group(1)
+                except Exception:
+                    return None
+                return None
+            dep = _find_amt([r"dep[oó]sito", r"cau[cç][aã]o", r"dep[oó]sito\s*de\s*(seguran[çc]a|cau[çc][aã]o)", r"deposit"]) or None
+            fra = _find_amt([r"franq[uú]ia", r"excesso", r"excesso\s*de\s*dano?s?", r"excess", r"franchise", r"deductible"]) or None
+            # Debug: if both missing, persist a small trace to DEBUG_DIR for inspection
+            try:
+                if (not dep) and (not fra):
+                    from hashlib import md5 as _md5
+                    h = _md5((url or "").encode("utf-8")).hexdigest()[:10]
+                    (DEBUG_DIR / f"ins_missing_{h}.txt").write_text(
+                        f"URL: {url}\nSNIPPET: {text[:1800]}\n",
+                        encoding="utf-8"
+                    )
+            except Exception:
+                pass
+            return (dep, fra)
+
+        tasks = []
+        # Only enrich items that don't already have values
+        for i, it in enumerate(items[: max(0, limit) ]):
+            if (it.get("deposit") or it.get("franchise") or it.get("excess")):
+                continue
+            tasks.append(_fetch_and_parse(it))
+        if not tasks:
+            return
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        j = 0
+        for i, it in enumerate(items[: max(0, limit) ]):
+            if (it.get("deposit") or it.get("franchise") or it.get("excess")):
+                continue
+            if j >= len(results):
+                break
+            res = results[j]; j += 1
+            if isinstance(res, Exception):
+                continue
+            dep, fra = res
+            if dep:
+                it["deposit"] = dep
+            if fra:
+                it["franchise"] = fra
+    except Exception:
+        return
 
 
 def try_direct_carjet(location_name: str, start_dt, end_dt, lang: str = "pt", currency: str = "EUR") -> str:
@@ -3367,6 +3733,20 @@ def post_with_optional_proxy(url: str, data: Dict[str, Any], headers: Dict[str, 
         return _HTTPX_CLIENT.post(url, headers=headers, data=data)
     return requests.post(url, headers=headers, data=data, timeout=20)
 
+def _apply_depband(items: List[Dict[str, Any]], dep_band: str):
+    try:
+        band = (dep_band or "").strip().lower()
+        if band not in ("low", "medium"):
+            return
+        level = "low" if band == "low" else "medium"
+        for it in (items or []):
+            try:
+                it["deposit_level"] = level
+            except Exception:
+                continue
+    except Exception:
+        return
+
 
 @app.post("/api/bulk-prices")
 async def bulk_prices(request: Request):
@@ -3415,6 +3795,11 @@ async def bulk_prices(request: Request):
                 t_fetch = int((time.time() - t0) * 1000)
                 t1 = time.time()
                 items = await asyncio.to_thread(parse_prices, html, url)
+                # Enrich deposit_level using CarJet filtered lists when available
+                try:
+                    await _enrich_deposit_level_from_filters(html, url, headers, items)
+                except Exception:
+                    pass
                 items = convert_items_gbp_to_eur(items)
                 items = apply_price_adjustments(items, url)
                 items = normalize_and_sort(items, supplier_priority)
@@ -3472,6 +3857,7 @@ async def track_by_url(request: Request):
     url: str = body.get("url") or ""
     no_cache: bool = bool(body.get("noCache", False))
     currency: str = body.get("currency", "")
+    dep_band: str = (body.get("depBand") or "").strip().lower()  # none|low|medium
     if not url:
         return _no_store_json({"ok": False, "error": "url is required"}, status_code=400)
 
@@ -3547,6 +3933,14 @@ async def track_by_url(request: Request):
                                 items_fast = items_fast2
                     except Exception:
                         pass
+                # Enrich deposit_level by comparing with CarJet filtered lists (<=250, <=500)
+                try:
+                    await _enrich_deposit_level_from_filters(html_fast, url, fast_headers, items_fast)
+                except Exception:
+                    pass
+                # Optional override banding
+                if dep_band in ("low", "medium"):
+                    _apply_depband(items_fast, dep_band)
                 items_fast = normalize_and_sort(items_fast, supplier_priority=None)
                 payload = {
                     "ok": True,
@@ -4024,6 +4418,40 @@ def normalize_and_sort(items: List[Dict[str, Any]], supplier_priority: Optional[
                 price_curr = "EUR"
             except Exception:
                 pass
+        # Derive deposit fields and level; sanitize against mis-capture
+        dep_txt_in = it.get("deposit", "") or ""
+        fra_txt_in = it.get("franchise", it.get("excess", "")) or ""
+        dep_num = None
+        fra_num = None
+        try:
+            dep_num = _parse_amount(dep_txt_in) if dep_txt_in else None
+        except Exception:
+            dep_num = None
+        try:
+            fra_num = _parse_amount(fra_txt_in) if fra_txt_in else None
+        except Exception:
+            fra_num = None
+        try:
+            if dep_num is not None and fra_num is not None and dep_num >= fra_num:
+                dep_txt_in = ""
+                dep_num = None
+        except Exception:
+            pass
+        deposit_level = (it.get("deposit_level") or "").strip().lower()
+        if not deposit_level:
+            # Default to high; downgrade if thresholds met
+            deposit_level = "high"
+            try:
+                if dep_num is not None:
+                    if dep_num <= 250:
+                        deposit_level = "low"
+                    elif dep_num <= 500:
+                        deposit_level = "medium"
+                    else:
+                        deposit_level = "high"
+            except Exception:
+                deposit_level = "high"
+
         row = {
             "supplier": it.get("supplier", ""),
             "car": it.get("car", ""),
@@ -4035,6 +4463,9 @@ def normalize_and_sort(items: List[Dict[str, Any]], supplier_priority: Optional[
             "transmission": it.get("transmission", ""),
             "photo": it.get("photo", ""),
             "link": it.get("link", ""),
+            "deposit": dep_txt_in,
+            "deposit_level": deposit_level,
+            "franchise": fra_txt_in,
         }
         if (row["car"] or "").strip():
             detailed.append(row)

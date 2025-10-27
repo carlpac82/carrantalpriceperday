@@ -150,7 +150,7 @@
             <div id="daysChips" class="flex flex-nowrap gap-1"></div>
           </div>
           <!-- Botão Pesquisar (linha abaixo de todos os campos) -->
-          <div class="md:col-span-12">
+          <div class="md:col-span-12 flex items-center gap-3">
             <button id="fetchAllBtn" type="button" class="btn-search">Pesquisar</button>
           </div>
           <div class="md:col-span-1 seg hidden">
@@ -763,6 +763,32 @@
         return it.category || '';
       }
 
+      // Helpers to parse amounts like "1.300,00 €", "1,300.00 €", "€ 1.300" into a number
+      function parseEuro(str) {
+        if (!str) return null;
+        const s = String(str).replace(/\s+/g, ' ').trim();
+        const m = s.match(/([\d.,]+)/);
+        if (!m) return null;
+        let num = m[1];
+        const hasDot = num.includes('.');
+        const hasComma = num.includes(',');
+        if (hasDot && hasComma) {
+          if (num.lastIndexOf(',') > num.lastIndexOf('.')) {
+            num = num.replace(/\./g, '').replace(',', '.');
+          } else {
+            num = num.replace(/,/g, '');
+          }
+        } else if (!hasDot && hasComma) {
+          if (/^\d{1,3}(,\d{3})+$/.test(num)) num = num.replace(/,/g, ''); else num = num.replace(',', '.');
+        } else if (hasDot && !hasComma) {
+          if (/^\d{1,3}(\.\d{3})+$/.test(num)) num = num.replace(/\./g, '');
+        }
+        const val = Number(num);
+        return Number.isFinite(val) ? val : null;
+      }
+
+      // Removed insurance/deposit rendering and helpers
+
       function renderCardsForItems(items) {
         return `
           <div class="grid grid-cols-1 gap-3">
@@ -774,6 +800,7 @@
                     <div class="text-xs text-gray-500">${escapeHtml(displaySupplierName(it.supplier))}</div>
                     <div class="text-sm font-medium text-gray-900 truncate">${escapeHtml(it.car || '-')}</div>
                     <div class="text-xs text-gray-600">${escapeHtml(displayCategory(it))}</div>
+                    
                   </div>
                   <div class="text-right">
                     <div class="text-sm font-semibold text-gray-900">${escapeHtml(it.price || '')}</div>
@@ -796,6 +823,7 @@
                     <th class="px-4 py-2 text-left text-xs font-medium text-white uppercase">Supplier</th>
                     <th class="px-4 py-2 text-left text-xs font-medium text-white uppercase">Car</th>
                     <th class="px-4 py-2 text-left text-xs font-medium text-white uppercase">Category</th>
+                    
                     <th class="px-4 py-2 text-left text-xs font-medium text-white uppercase">Total Price</th>
                   </tr>
                 </thead>
@@ -809,6 +837,7 @@
                       <td class="px-4 py-2 text-sm">${escapeHtml(displaySupplierName(it.supplier))}</td>
                       <td class="px-4 py-2 text-sm">${escapeHtml(it.car || '-')}</td>
                       <td class="px-4 py-2 text-sm">${escapeHtml(displayCategory(it))}</td>
+                      
                       <td class="px-4 py-2 text-sm font-medium">${escapeHtml(it.price || '')}</td>
                     </tr>
                   `).join('')}
@@ -862,6 +891,20 @@
         const modal = document.getElementById('loadingModal');
         const bar = document.querySelector('#loadingModal .progress .bar');
         if (modal) { modal.classList.add('loading'); modal.classList.remove('hidden'); }
+        // Start real-time progress updates up to 85%
+        let prog = 8;
+        let progTimer = null;
+        if (bar) { bar.style.width = prog + '%'; }
+        try { if (progTimer) clearInterval(progTimer); } catch(_){}
+        progTimer = setInterval(() => {
+          try {
+            if (!bar) return;
+            // Increase quickly at first, then slow down, cap at 85%
+            const inc = prog < 40 ? 3 : (prog < 70 ? 2 : 1);
+            prog = Math.min(85, prog + inc);
+            bar.style.width = prog + '%';
+          } catch(_){}
+        }, 160);
         try {
           const body = { location, start_date, start_time, days, lang: 'pt', currency: 'EUR' };
           // Proactive warmup to avoid first-click issues
